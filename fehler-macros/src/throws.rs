@@ -101,7 +101,7 @@ impl Fold for Throws {
 
     fn fold_expr_return(&mut self, i: syn::ExprReturn) -> syn::ExprReturn {
         let ok = match &i.expr {
-            Some(expr)  => ok(expr, false),
+            Some(expr)  => ok(expr),
             None        => ok_unit(false),
         };
         syn::ExprReturn { expr: Some(Box::new(ok)), ..i }
@@ -120,7 +120,24 @@ fn modify_tail(is_unit_fn: bool, stmts: &mut Vec<syn::Stmt>) {
             stmts.push(syn::Stmt::Expr(ok_unit(true)));
         }
         Some(syn::Stmt::Expr(e))    => {
-            *e = ok(e, true);
+            // In this case, it is necessary to keep the original attributes
+            // before wrapping the expression. The generated code will have
+            // attributes attached outside of Ok-wrapping as follows:
+            // 
+            //   // from
+            //   #[allow(unreachable_code, ...)]
+            //   tail_expr
+            // 
+            //   // to
+            //   #[allow(unreachable_code, ...)]
+            //   <_ as ::fehler::__internal::_Succeed>::from_ok(tail_expr)
+            //
+            let attrs = take_attrs(e);
+            let ok = ok(e);
+            *e = syn::Expr::Verbatim(quote::quote! {
+                #(#attrs)*
+                #ok
+            });
         }
         _ if is_unit_fn             => {
             stmts.push(syn::Stmt::Expr(ok_unit(true)));
@@ -141,24 +158,38 @@ fn is_unit_fn(i: &syn::ReturnType) -> bool {
     }
 }
 
-fn ok(expr: &syn::Expr, is_tail: bool) -> syn::Expr {
-    if is_tail {
-        syn::parse_quote! {
-            #[allow(unreachable_code)]
-            <_ as ::fehler::__internal::_Succeed>::from_ok(#expr)
-        }
-    } else {
-        syn::parse_quote!(<_ as ::fehler::__internal::_Succeed>::from_ok(#expr))
-    }
+fn ok(expr: &syn::Expr) -> syn::Expr {
+    syn::parse2(quote::quote!(<_ as ::fehler::__internal::_Succeed>::from_ok(#expr))).unwrap()
 }
 
-fn ok_unit(is_tail: bool) -> syn::Expr {
-    if is_tail {
-        syn::parse_quote! {
-            #[allow(unreachable_code)]
-            <_ as ::fehler::__internal::_Succeed>::from_ok(())
-        }
+fn ok_unit(with_attr: bool) -> syn::Expr {
+    let attr = if with_attr {
+        Some(quote::quote!( #[allow(unreachable_code)] ))
     } else {
-        syn::parse_quote!(<_ as ::fehler::__internal::_Succeed>::from_ok(()))
+        None
+    };
+    syn::parse2(quote::quote! {
+        #attr
+        <_ as ::fehler::__internal::_Succeed>::from_ok(())
+    }).unwrap()
+}
+
+fn take_attrs(e: &mut syn::Expr) -> Vec<syn::Attribute> {
+    macro_rules! body {
+        ($($Variant:ident),*) => {
+            match e {
+                $(
+                    syn::Expr::$Variant(e) => e.attrs.drain(..).collect(),
+                )*
+                _ => unreachable!(),
+            }
+        }
     }
+    body!(
+        Array, Assign, AssignOp, Async, Await, Binary, Block,
+        Box, Break, Call, Cast, Closure, Continue, Field, ForLoop,
+        Group, If, Index, Let, Lit, Loop, Macro, Match, MethodCall,
+        Paren, Path, Range, Reference, Repeat, Return, Struct,
+        Try, TryBlock, Tuple, Type, Unary, Unsafe, While, Yield
+    )
 }
